@@ -84,3 +84,54 @@ Python · Streamlit · Google OR-Tools (CP-SAT) · pandas · Plotly · openpyxl
 ## About
 
 Built by **Inseo Lee** as part of an MSc Business Analytics (Operational Research and Risk Analysis) dissertation at the University of Manchester, in partnership with an NHS hospital trust. I designed the optimisation model, the operational rules and the interface, and delivered the tool to pharmacy staff with a user guide and live demonstration.
+
+
+
+## Automated QA Testing
+
+I extended this NHS scheduling application with automated tests using **Pytest and Playwright** to practise software quality assurance on a real Python project.
+
+### What I tested
+
+**Pytest – Data validation (3 tests)**
+- Check the integrity of synthetic trial records.
+- Verify the presence of incomplete data.
+- Check specialist workstream requirements in the sample dataset.
+
+**Playwright – Browser automation (2 tests)**
+- Open the Streamlit application and load synthetic trial data.
+- Change CT capacity, save the settings and generate a schedule.
+- Verify the calculation status and confirm that capacity settings persist after navigating between pages.
+
+**Local test results:** 5 tests passed (Python 3.14, October 2026).
+
+### How to run the tests
+
+Install the dependencies:
+
+```bash
+pip install -r requirements.txt
+pip install pytest pytest-playwright
+python -m playwright install chromium
+```
+
+Run the data tests:
+
+```bash
+python -m pytest -q tests/test_sample_data.py
+```
+
+Start the Streamlit application in one terminal:
+
+```bash
+python -m streamlit run app.py --server.port 8501
+```
+
+Then run the browser tests in another terminal:
+
+```bash
+python -m pytest -q tests/test_browser.py
+```
+
+These are smoke and data-validation tests, not a complete verification of the optimisation algorithm. The project uses synthetic demonstration data for public testing.
+
