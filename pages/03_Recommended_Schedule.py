@@ -1,3 +1,451 @@
+import importlib
+import copy
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+import nhs_core as _core
+import nhs_solver as _nhs_solver
+import ui_components as ui
+
+# Reload local scheduling modules so Streamlit cannot mix old cached logic with new page code.
+core = importlib.reload(_core)
+nhs_solver = importlib.reload(_nhs_solver)
+core.initialise_state()
+
+
+def _series(df, column, default=None):
+    if column in df.columns:
+        return df[column]
+    return pd.Series([default] * len(df), index=df.index)
+
+
+def _safe_int(value, default=0):
+    n = pd.to_numeric(value, errors="coerce")
+    return default if pd.isna(n) else int(round(float(n)))
+
+
+def _uk_date_strings(df, columns):
+    out = df.copy()
+    for col in columns:
+        if col in out.columns:
+            out[col] = out[col].map(core.format_date_for_display)
+    return out
+
+
+st.title("Recommended Schedule")
+st.caption(
+    "Generate the real-date Pharmacy recommendation, review the decision summary first, then open detailed workstream dates only when needed."
+)
+
+if st.session_state.trial_table is None:
+    st.warning("No trial data has been loaded. Go to **Trials** first.")
+    core.render_page_navigation(
+        previous_page="pages/02_Trial_Prioritisation.py",
+        next_page="pages/04_Saved_Work.py",
+        previous_label="Prioritise",
+        next_label="Review",
+    )
+    st.stop()
+
+operational = core.build_operational_view(st.session_state.trial_table, st.session_state.assumptions)
+ready_mask = operational["model_ready"].fillna(False).astype(bool) if len(operational) else pd.Series(dtype=bool)
+ready_count = int(ready_mask.sum()) if len(operational) else 0
+completed_mask = operational["effective_trial_status"].eq(core.STATUS_COMPLETED) if len(operational) else pd.Series(dtype=bool)
+completed_count = int(completed_mask.sum()) if len(operational) else 0
+excluded_active_count = int(((~ready_mask) & (~completed_mask)).sum()) if len(operational) else 0
+existing_count = int((ready_mask & operational["effective_trial_status"].eq(core.STATUS_IN_PROGRESS)).sum()) if len(operational) else 0
+new_count = max(0, ready_count - existing_count)
+
+ui.mini_stats([
+    ("Loaded", len(operational)),
+    ("Eligible", ready_count),
+    ("Existing / in progress", existing_count),
+    ("New / not started", new_count),
+    ("Completed", completed_count),
+    ("Excluded active", excluded_active_count),
+])
+
+control_left, control_right = st.columns([3, 1])
+with control_left:
+    if st.session_state.get("schedule_dirty") and st.session_state.get("schedule_result") is not None:
+        st.warning("Inputs changed after the previous calculation. Recalculate before using the recommendation.")
+    elif st.session_state.get("schedule_result") is None:
+        st.info(f"{ready_count} trial(s) are currently eligible for scheduling.")
+    elif st.session_state.get("quick_demo_active") and st.session_state.get("uploaded_source_type") == "synthetic sample":
+        st.success("Schedule ready · Up to date · Synthetic demo data (not live NHS records).")
+    else:
+        st.success("The current schedule matches the latest saved inputs.")
+with control_right:
+    recalc = st.button(
+        "Generate / recalculate",
+        type="primary",
+        use_container_width=True,
+        disabled=ready_count == 0,
+    )
+
+if recalc:
+    try:
+        with st.spinner("Optimising Pharmacy schedule…"):
+            result = nhs_solver.solve_nhs_schedule(st.session_state.trial_table, st.session_state.assumptions)
+        st.session_state.schedule_result = result["schedule"]
+        st.session_state.schedule_info = result.get("technical_info", {})
+        core.mark_schedule_clean(auto_save=True)
+        st.rerun()
+    except Exception as exc:
+        st.error(f"Could not generate the schedule: {exc}")
+
+schedule = st.session_state.get("schedule_result")
+
+# PORTFOLIO QUICK EXPERIMENT — Only show on a valid synthetic demo schedule.
+# No change to the clinical optimisation engine. Before/after results are kept
+# separately in the visitor's Streamlit session.
+if (st.session_state.get("quick_demo_active")
+        and st.session_state.get("uploaded_source_type") == "synthetic sample"
+        and schedule is not None and len(schedule) > 0
+        and not st.session_state.get("schedule_dirty", False)):
+    st.markdown("### Try a what-if experiment")
+    st.write("CT capacity = the maximum number of trials the CT pharmacy team can handle at once "
+             "(concurrent slots, not staff headcount). Try 3 → 5 to see how the schedule changes.")
+    st.caption("For ePMA capacity, temporary capacity reductions and other detailed settings, "
+               "open **Capacity**. Results are modelled scenarios, not observed NHS outcomes.")
+    st.page_link("pages/05_Capacity_Planning.py", label="More capacity settings", icon="⚙️")
+    current_ct = int(st.session_state.assumptions.get("cap_ct", 3))
+    with st.form("quick_ct_capacity_form"):
+        trial_ct = st.number_input("CT capacity (concurrent trial slots)", min_value=1,
+                                   max_value=50, value=current_ct, step=1,
+                                   help="Maximum number of trials using CT capacity concurrently. "
+                                        "This is an assumed planning constraint, not a staffing headcount.")
+        run_whatif = st.form_submit_button("Recalculate and compare", type="primary",
+                                           use_container_width=True)
+    if run_whatif:
+        if int(trial_ct) == current_ct:
+            st.info("Choose a different CT capacity to compare two schedules.")
+        else:
+            previous_assumptions = copy.deepcopy(st.session_state.assumptions)
+            previous_trials = st.session_state.trial_table.copy(deep=True)
+            previous_schedule = st.session_state.schedule_result.copy(deep=True)
+            previous_info = copy.deepcopy(st.session_state.get("schedule_info") or {})
+            try:
+                new_assumptions = copy.deepcopy(previous_assumptions)
+                new_assumptions["cap_ct"] = int(trial_ct)
+                new_assumptions["capacity_exceptions"] = core.normalise_capacity_exceptions(
+                    new_assumptions.get("capacity_exceptions", []), new_assumptions
+                )
+                new_trials = core.normalise_edited_trials(
+                    previous_trials, previous_trials, new_assumptions
+                )
+                with st.spinner("Recalculating the synthetic schedule…"):
+                    new_result = nhs_solver.solve_nhs_schedule(new_trials, new_assumptions)
+                new_schedule = new_result.get("schedule")
+                if new_schedule is None or len(new_schedule) == 0:
+                    raise ValueError("No schedule was returned for the selected capacity.")
+                st.session_state["whatif_before_schedule"] = previous_schedule
+                st.session_state["whatif_before_ct"] = current_ct
+                st.session_state["whatif_after_ct"] = int(trial_ct)
+                st.session_state.assumptions = new_assumptions
+                st.session_state.trial_table = new_trials
+                st.session_state.schedule_result = new_schedule
+                st.session_state.schedule_info = new_result.get("technical_info", {})
+                core.mark_schedule_clean(auto_save=True)
+                st.rerun()
+            except Exception as exc:
+                # Keep the original inputs and schedule on any failure.
+                st.session_state.assumptions = previous_assumptions
+                st.session_state.trial_table = previous_trials
+                st.session_state.schedule_result = previous_schedule
+                st.session_state.schedule_info = previous_info
+                st.error(f"Could not recalculate the what-if scenario: {exc}")
+
+    before = st.session_state.get("whatif_before_schedule")
+    if before is not None and len(before) > 0:
+        before_margins = pd.to_numeric(before.get("margin_days"), errors="coerce")
+        after_margins = pd.to_numeric(schedule.get("margin_days"), errors="coerce")
+        before_late = int((before_margins < 0).sum())
+        after_late = int((after_margins < 0).sum())
+        before_on = int((before_margins >= 0).sum())
+        after_on = int((after_margins >= 0).sum())
+        st.markdown("#### Before vs after — modelled outcomes")
+        st.caption("Both results are hypothetical schedules from synthetic data. "
+                   "Changing capacity may not improve the result, depending on other constraints.")
+        compare = pd.DataFrame({
+            "Measure": ["CT capacity (concurrent slots)", "Predicted on-time trials",
+                        "Predicted late trials", "Total modelled lateness (days)"],
+            "Before": [st.session_state.get("whatif_before_ct"), before_on, before_late,
+                       round(float((-before_margins.clip(upper=0)).sum()), 1)],
+            "After": [st.session_state.get("whatif_after_ct"), after_on, after_late,
+                      round(float((-after_margins.clip(upper=0)).sum()), 1)],
+        })
+        st.dataframe(compare, hide_index=True, use_container_width=True)
+        before_total = float((-before_margins.clip(upper=0)).sum())
+        after_total = float((-after_margins.clip(upper=0)).sum())
+        improvement = before_total - after_total
+        if before_on == after_on and before_late == after_late and improvement > 0.01:
+            st.info(
+                f"Same number of on-time and late trials, but total modelled lateness "
+                f"is {improvement:,.1f} days lower. In other words, the model predicts "
+                "less severe delays, even though no additional trials meet the deadline. "
+                "This does not represent a measured improvement in hospital operations."
+            )
+        elif before_on == after_on and before_late == after_late and abs(improvement) <= 0.01:
+            st.info("The number of on-time trials and total modelled lateness did not change. "
+                    "CT capacity may not be the limiting factor under these assumptions.")
+        elif improvement > 0.01:
+            st.info(f"Total modelled lateness is {improvement:,.1f} days lower under the new CT capacity. "
+                    "These are simulated results, not observed hospital outcomes.")
+        elif improvement < -0.01:
+            st.info(f"Total modelled lateness is {-improvement:,.1f} days higher under the new CT capacity. "
+                    "These are simulated results, not observed hospital outcomes.")
+        else:
+            st.info("Compare on-time counts and trial-level timings below. "
+                    "These are simulated results, not observed hospital outcomes.")
+        st.caption("Use the Summary and Detailed schedule tabs below to inspect trial-level changes.")
+
+if schedule is None or len(schedule) == 0:
+    with st.expander(f"Why {len(operational.loc[~ready_mask]) if len(operational) else 0} trial(s) are not currently scheduled", expanded=False):
+        excluded = operational.loc[~ready_mask].copy() if len(operational) else pd.DataFrame()
+        if excluded.empty:
+            st.caption("No excluded trials.")
+        else:
+            ex_view = pd.DataFrame({
+                "Trial": excluded["trial_id"].astype(str),
+                "Status": excluded["effective_trial_status"].map(ui.status_label),
+                "Why": excluded.get("scheduling_block_reason", ""),
+            })
+            st.dataframe(ui.dataframe_badge_style(ex_view, status_columns=["Status"]), use_container_width=True, hide_index=True)
+    core.render_page_navigation(
+        previous_page="pages/02_Trial_Prioritisation.py",
+        next_page="pages/04_Saved_Work.py",
+        previous_label="Prioritise",
+        next_label="Review",
+    )
+    st.stop()
+
+schedule = core.sync_schedule_metadata(schedule, st.session_state.trial_table)
+
+# Invalidate schedules produced under the retired CT-progress rule.
+stale_ct_schedule = False
+if "ct_progress_status" in schedule.columns:
+    stale_ct_schedule = schedule["ct_progress_status"].astype(str).eq("Own work complete (estimated)").any()
+if stale_ct_schedule:
+    st.session_state.schedule_result = None
+    st.session_state.schedule_info = None
+    st.session_state.schedule_dirty = True
+    st.warning("This schedule was calculated with an older CT-progress rule and has been cleared. Recalculate to use the current conservative CT rule.")
+    st.stop()
+
+st.session_state.schedule_result = schedule.copy()
+for col in [
+    "clock_start", "pharmacy_notified_date", "due_date_rec", "CT_start_rec", "CT_end_rec", "CT_capacity_end_rec",
+    "Aseptic_start_rec", "Aseptic_end_rec", "ePMA_start_rec", "ePMA_end_rec", "completion_rec",
+]:
+    if col in schedule.columns:
+        schedule[col] = pd.to_datetime(schedule[col], errors="coerce")
+
+margin = pd.to_numeric(_series(schedule, "margin_days"), errors="coerce")
+planning_date = pd.Timestamp(st.session_state.assumptions["planning_date"])
+ct_capacity_mode = str(st.session_state.assumptions.get("ct_capacity_mode", "continuous"))
+
+n_on_time = int((margin >= 0).sum())
+n_late = int((margin < 0).sum())
+n_inherited = int(pd.to_numeric(_series(schedule, "inherited_overdue_days", 0), errors="coerce").fillna(0).gt(0).sum())
+avg_margin = margin.mean() if margin.notna().any() else float("nan")
+avg_margin_text = "N/A" if pd.isna(avg_margin) else f"{avg_margin:+.1f} days"
+
+m1, m2, m3, m4 = st.columns(4)
+ui.metric_card(m1, "Scheduled", len(schedule), tone="primary")
+ui.metric_card(m2, "Predicted on time", n_on_time, tone="success")
+ui.metric_card(m3, "Predicted late", n_late, tone="danger" if n_late else "success")
+ui.metric_card(m4, "Average margin", avg_margin_text, tone="success" if pd.notna(avg_margin) and avg_margin >= 0 else "danger")
+ui.mini_stats([("Already overdue at snapshot", n_inherited), ("CT capacity rule", "Continuous oversight" if ct_capacity_mode == "continuous" else "Active work only")])
+
+info = st.session_state.get("schedule_info") or {}
+with st.expander("Solution quality & technical status", expanded=False):
+    c1, c2, c3 = st.columns(3)
+    c1.write(f"Step 1: **{info.get('status_step1', 'Unknown')}**")
+    c2.write(f"Step 2: **{info.get('status_step2', 'Unknown')}**")
+    gap = info.get("step2_gap_pct")
+    c3.write(f"Step-2 gap: **{gap:.2f}%**" if isinstance(gap, (int, float)) else "Step-2 gap: **N/A**")
+    if info.get("reproducible_mode"):
+        st.caption("Reproducible mode is active: fixed seed, deterministic search configuration and canonicalisation of the Step-2 incumbent.")
+
+summary_tab, detail_tab, timeline_tab, export_tab = st.tabs([
+    "Summary", "Detailed schedule", "Gantt", "Export"
+])
+
+with summary_tab:
+    st.markdown("#### Decision summary")
+    st.caption("This is the default operational view: rank, due date, expected completion, margin and decision.")
+    summary = pd.DataFrame({
+        "Rank": pd.to_numeric(schedule["final_rank"], errors="coerce").astype("Int64"),
+        "Trial": schedule["trial_id"].astype(str),
+        "Status": _series(schedule, "effective_trial_status", "").map(ui.status_label),
+        "55-day due": _series(schedule, "due_date_rec").map(core.format_date_for_display),
+        "Expected completion": _series(schedule, "completion_rec").map(core.format_date_for_display),
+        "Margin": _series(schedule, "margin_days").map(ui.margin_label),
+        "Decision": _series(schedule, "final_decision", "").fillna("").replace("", "—"),
+    }).sort_values("Rank")
+    st.dataframe(
+        ui.dataframe_badge_style(summary, status_columns=["Status"], margin_columns=["Margin"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    late = schedule.loc[margin < 0].copy()
+    if len(late):
+        st.markdown("#### Predicted-late trials")
+        late_view = pd.DataFrame({
+            "Trial": late["trial_id"].astype(str),
+            "Due": late["due_date_rec"].map(core.format_date_for_display),
+            "Expected completion": late["completion_rec"].map(core.format_date_for_display),
+            "Margin": late["margin_days"].map(ui.margin_label),
+            "Priority": pd.to_numeric(_series(late, "effective_priority_score"), errors="coerce"),
+        }).sort_values("Margin")
+        st.dataframe(ui.dataframe_badge_style(late_view, margin_columns=["Margin"]), use_container_width=True, hide_index=True)
+
+with detail_tab:
+    st.markdown("#### Detailed workstream schedule")
+    st.caption(
+        "Use this view for audit/detail rather than first-line decision making. Aseptic and ePMA can start after the configured CT handoff and may run in parallel with ongoing CT work."
+    )
+    detailed = pd.DataFrame({
+        "Rank": pd.to_numeric(schedule["final_rank"], errors="coerce").astype("Int64"),
+        "Trial": schedule["trial_id"].astype(str),
+        "Status": _series(schedule, "effective_trial_status", "").map(ui.status_label),
+        "Queue type": _series(schedule, "queue_type", ""),
+        "CT progress": _series(schedule, "ct_progress_status", "").map(ui.status_label),
+        "Aseptic progress": _series(schedule, "aseptic_progress_status", "").map(ui.status_label),
+        "ePMA progress": _series(schedule, "epma_progress_status", "").map(ui.status_label),
+        "CT start": _series(schedule, "CT_start_rec").map(core.format_date_for_display),
+        "CT active-work end": _series(schedule, "CT_end_rec").map(core.format_date_for_display),
+        "CT capacity held until": _series(schedule, "CT_capacity_end_rec").map(core.format_date_for_display),
+        "Aseptic start": _series(schedule, "Aseptic_start_rec").map(core.format_date_for_display),
+        "Aseptic end": _series(schedule, "Aseptic_end_rec").map(core.format_date_for_display),
+        "ePMA start": _series(schedule, "ePMA_start_rec").map(core.format_date_for_display),
+        "ePMA end": _series(schedule, "ePMA_end_rec").map(core.format_date_for_display),
+        "Expected completion": _series(schedule, "completion_rec").map(core.format_date_for_display),
+        "Margin": _series(schedule, "margin_days").map(ui.margin_label),
+    }).sort_values("Rank")
+    st.dataframe(
+        ui.dataframe_badge_style(
+            detailed,
+            status_columns=["Status", "CT progress", "Aseptic progress", "ePMA progress"],
+            margin_columns=["Margin"],
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("#### Inspect one trial")
+    trial_options = schedule.sort_values("final_rank")["trial_id"].astype(str).tolist()
+    selected = st.selectbox("Trial", trial_options, key="schedule_detail_trial")
+    r = schedule.loc[schedule["trial_id"].astype(str).eq(selected)].iloc[0]
+    ui.trial_summary_card(
+        trial=selected,
+        status=r.get("effective_trial_status", ""),
+        due=r.get("due_date_rec"),
+        completion=r.get("completion_rec"),
+        margin=r.get("margin_days"),
+        priority=r.get("effective_priority_score"),
+        queue_type=r.get("queue_type", ""),
+    )
+    workstream_rows = []
+    for label, sc, ec, rem in [
+        ("CT", "CT_start_rec", "CT_end_rec", "ct_remaining_bdays"),
+        ("Aseptic", "Aseptic_start_rec", "Aseptic_end_rec", "aseptic_remaining_bdays"),
+        ("ePMA", "ePMA_start_rec", "ePMA_end_rec", "epma_remaining_bdays"),
+    ]:
+        remaining = _safe_int(r.get(rem), 0)
+        if remaining <= 0:
+            state = "Completed / N/A"
+        else:
+            state = "Scheduled"
+        workstream_rows.append({
+            "Workstream": label,
+            "State": ui.status_label(state),
+            "Start": core.format_date_for_display(r.get(sc)),
+            "End": core.format_date_for_display(r.get(ec)),
+            "Remaining working days": remaining,
+        })
+    ws_df = pd.DataFrame(workstream_rows)
+    st.dataframe(ui.dataframe_badge_style(ws_df, status_columns=["State"]), use_container_width=True, hide_index=True)
+
+    with st.expander("Complexity & duration inputs used", expanded=False):
+        due_for_audit = pd.to_datetime(_series(schedule, "due_date_rec"), errors="coerce")
+        audit = pd.DataFrame({
+            "Trial": schedule["trial_id"].astype(str),
+            "CT Complexity": _series(schedule, "ct_complexity", "Unknown"),
+            "CT full days": pd.to_numeric(_series(schedule, "ct_duration_bdays"), errors="coerce"),
+            "CT planning allowance": pd.to_numeric(_series(schedule, "ct_remaining_bdays", 0), errors="coerce"),
+            "Aseptic full days": pd.to_numeric(_series(schedule, "aseptic_duration_bdays"), errors="coerce"),
+            "Aseptic remaining": pd.to_numeric(_series(schedule, "aseptic_remaining_bdays", 0), errors="coerce"),
+            "ePMA Complexity": _series(schedule, "epma_complexity", "N/A"),
+            "ePMA full days": pd.to_numeric(_series(schedule, "epma_duration_bdays"), errors="coerce"),
+            "ePMA remaining": pd.to_numeric(_series(schedule, "epma_remaining_bdays", 0), errors="coerce"),
+            "55-day due": due_for_audit.map(core.format_date_for_display),
+            "Calendar days left": (due_for_audit - planning_date).dt.days,
+        })
+        st.dataframe(audit, use_container_width=True, hide_index=True)
+
+with timeline_tab:
+    st.markdown("#### Gantt view")
+    st.caption(
+        "Green = observed tracker progress; blue = recommended future work. Switch the grouping depending on whether you are reviewing a trial journey or resource workload."
+    )
+    control1, control2 = st.columns([1, 3])
+    with control1:
+        view_mode = st.radio("Group Gantt", ["By trial", "By resource"], horizontal=False, key="gantt_group_mode")
+    with control2:
+        ordered_ids = schedule.sort_values("final_rank")["trial_id"].astype(str).tolist()
+        selected_trials = st.multiselect(
+            "Trials shown",
+            ordered_ids,
+            default=ordered_ids,
+            help="Reduce the selection when the portfolio is large to make the timeline easier to read.",
+            key="gantt_trials_shown",
+        )
+
+    rows = []
+    workstream_order = {"CT": 0, "Aseptic": 1, "ePMA": 2}
+    for _, r in schedule.loc[schedule["trial_id"].astype(str).isin(selected_trials)].iterrows():
+        trial = str(r["trial_id"])
+        rank = _safe_int(r.get("final_rank"), 0)
+        observed_specs = [
+            ("CT", "observed_pharmacy_setup_start", None),
+            ("Aseptic", "observed_aseptic_notify", "observed_aseptic_bmr_authorised"),
+            ("ePMA", "observed_iqemo_setup", "observed_iqemo_authorised"),
+        ]
+        for workstream, start_col, end_col in observed_specs:
+            start = pd.to_datetime(r.get(start_col), errors="coerce")
+            if pd.isna(start):
+                continue
+            end = planning_date if end_col is None else pd.to_datetime(r.get(end_col), errors="coerce")
+            if pd.isna(end):
+                end = planning_date
+            end = min(pd.Timestamp(end), planning_date)
+            if end < start:
+                continue
+            lane = f"{rank}. {trial} · {workstream}" if view_mode == "By trial" else f"{workstream} · {rank}. {trial}"
+            rows.append({
+                "Lane": lane,
+                "Trial": trial,
+                "Rank": rank,
+                "Workstream": workstream,
+                "Workstream order": workstream_order[workstream],
+                "Segment type": "Observed progress",
+                "Start": start,
+                "End": end,
+                "Detail": "Recorded tracker milestone(s) up to the planning date",
+            })
+
+        future_specs = [
+            ("CT", "CT_start_rec", "CT_end_rec", "ct_remaining_bdays"),
+            ("Aseptic", "Aseptic_start_rec", "Aseptic_end_rec", "aseptic_remaining_bdays"),
+            ("ePMA", "ePMA_start_rec", "ePMA_end_rec", "epma_remaining_bdays"),
+        ]
+        for workstream, sc, ec, remaining_col in future_specs:
+            remaining = pd.to_numeric(r.get(remaining_col), errors="coerce")
             if pd.isna(remaining) or float(remaining) <= 0:
                 continue
             start = pd.to_datetime(r.get(sc), errors="coerce")
