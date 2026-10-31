@@ -56,8 +56,9 @@ The 18-trial experiment used a common planning start to compare scheduling decis
 ## Run it locally
 
 ```bash
-git clone https://github.com/<your-username>/<repo-name>.git
-cd <repo-name>
+
+git clone https://github.com/inseo25611/nhs-trial-setup-scheduler.git
+cd nhs-trial-setup-scheduler
 pip install -r requirements.txt
 streamlit run app.py
 ```
