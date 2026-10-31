@@ -1,4 +1,5 @@
 import importlib
+import copy
 
 import pandas as pd
 import plotly.express as px
@@ -94,13 +95,91 @@ if recalc:
         st.error(f"Could not generate the schedule: {exc}")
 
 schedule = st.session_state.get("schedule_result")
+
+# PORTFOLIO QUICK EXPERIMENT — Only show on a valid synthetic demo schedule.
+# No change to the clinical optimisation engine. Before/after results are kept
+# separately in the visitor's Streamlit session.
+if (st.session_state.get("quick_demo_active")
+        and st.session_state.get("uploaded_source_type") == "synthetic sample"
+        and schedule is not None and len(schedule) > 0
+        and not st.session_state.get("schedule_dirty", False)):
+    st.markdown("### Try a what-if experiment")
+    st.write("Change the CT team capacity and see how the recommended schedule changes. "
+             "The model recalculates using the same synthetic trials and other settings.")
+    current_ct = int(st.session_state.assumptions.get("cap_ct", 3))
+    with st.form("quick_ct_capacity_form"):
+        trial_ct = st.number_input("CT capacity (concurrent trial slots)", min_value=1,
+                                   max_value=50, value=current_ct, step=1,
+                                   help="Maximum number of trials using CT capacity concurrently. "
+                                        "This is an assumed planning constraint, not a staffing headcount.")
+        run_whatif = st.form_submit_button("Recalculate and compare", type="primary",
+                                           use_container_width=True)
+    if run_whatif:
+        if int(trial_ct) == current_ct:
+            st.info("Choose a different CT capacity to compare two schedules.")
+        else:
+            previous_assumptions = copy.deepcopy(st.session_state.assumptions)
+            previous_trials = st.session_state.trial_table.copy(deep=True)
+            previous_schedule = st.session_state.schedule_result.copy(deep=True)
+            previous_info = copy.deepcopy(st.session_state.get("schedule_info") or {})
+            try:
+                new_assumptions = copy.deepcopy(previous_assumptions)
+                new_assumptions["cap_ct"] = int(trial_ct)
+                new_assumptions["capacity_exceptions"] = core.normalise_capacity_exceptions(
+                    new_assumptions.get("capacity_exceptions", []), new_assumptions
+                )
+                new_trials = core.normalise_edited_trials(
+                    previous_trials, previous_trials, new_assumptions
+                )
+                with st.spinner("Recalculating the synthetic schedule…"):
+                    new_result = nhs_solver.solve_nhs_schedule(new_trials, new_assumptions)
+                new_schedule = new_result.get("schedule")
+                if new_schedule is None or len(new_schedule) == 0:
+                    raise ValueError("No schedule was returned for the selected capacity.")
+                st.session_state["whatif_before_schedule"] = previous_schedule
+                st.session_state["whatif_before_ct"] = current_ct
+                st.session_state["whatif_after_ct"] = int(trial_ct)
+                st.session_state.assumptions = new_assumptions
+                st.session_state.trial_table = new_trials
+                st.session_state.schedule_result = new_schedule
+                st.session_state.schedule_info = new_result.get("technical_info", {})
+                core.mark_schedule_clean(auto_save=True)
+                st.rerun()
+            except Exception as exc:
+                # Keep the original inputs and schedule on any failure.
+                st.session_state.assumptions = previous_assumptions
+                st.session_state.trial_table = previous_trials
+                st.session_state.schedule_result = previous_schedule
+                st.session_state.schedule_info = previous_info
+                st.error(f"Could not recalculate the what-if scenario: {exc}")
+
+    before = st.session_state.get("whatif_before_schedule")
+    if before is not None and len(before) > 0:
+        before_margins = pd.to_numeric(before.get("margin_days"), errors="coerce")
+        after_margins = pd.to_numeric(schedule.get("margin_days"), errors="coerce")
+        before_late = int((before_margins < 0).sum())
+        after_late = int((after_margins < 0).sum())
+        before_on = int((before_margins >= 0).sum())
+        after_on = int((after_margins >= 0).sum())
+        st.markdown("#### Before vs after — modelled outcomes")
+        st.caption("Both results are hypothetical schedules from synthetic data. "
+                   "Changing capacity may not improve the result, depending on other constraints.")
+        compare = pd.DataFrame({
+            "Measure": ["CT capacity (concurrent slots)", "Predicted on-time trials",
+                        "Predicted late trials", "Total modelled lateness (days)"],
+            "Before": [st.session_state.get("whatif_before_ct"), before_on, before_late,
+                       round(float((-before_margins.clip(upper=0)).sum()), 1)],
+            "After": [st.session_state.get("whatif_after_ct"), after_on, after_late,
+                      round(float((-after_margins.clip(upper=0)).sum()), 1)],
+        })
+        st.dataframe(compare, hide_index=True, use_container_width=True)
+        st.caption("Use the Summary and Detailed schedule tabs below to inspect trial-level changes.")
+
 if (st.session_state.get("quick_demo_active")
         and schedule is not None and len(schedule) > 0
         and not st.session_state.get("schedule_dirty", False)):
     st.success("Demo ready — this schedule uses synthetic data, not live NHS records.")
-    st.info("Try a what-if test: open **Capacity**, change **CT capacity**, "
-            "click **Save core assumptions**, then return here and click "
-            "**Generate / recalculate**. Compare the new schedule with the previous result.")
+    st.caption("Use the what-if experiment above to change CT capacity and compare modelled results. For more settings, open Capacity.")
 if schedule is None or len(schedule) == 0:
     with st.expander(f"Why {len(operational.loc[~ready_mask]) if len(operational) else 0} trial(s) are not currently scheduled", expanded=False):
         excluded = operational.loc[~ready_mask].copy() if len(operational) else pd.DataFrame()
