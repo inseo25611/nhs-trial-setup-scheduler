@@ -94,6 +94,13 @@ if recalc:
         st.error(f"Could not generate the schedule: {exc}")
 
 schedule = st.session_state.get("schedule_result")
+if (st.session_state.get("quick_demo_active")
+        and schedule is not None and len(schedule) > 0
+        and not st.session_state.get("schedule_dirty", False)):
+    st.success("Demo ready — this schedule uses synthetic data, not live NHS records.")
+    st.info("Try a what-if test: open **Capacity**, change **CT capacity**, "
+            "click **Save core assumptions**, then return here and click "
+            "**Generate / recalculate**. Compare the new schedule with the previous result.")
 if schedule is None or len(schedule) == 0:
     with st.expander(f"Why {len(operational.loc[~ready_mask]) if len(operational) else 0} trial(s) are not currently scheduled", expanded=False):
         excluded = operational.loc[~ready_mask].copy() if len(operational) else pd.DataFrame()
