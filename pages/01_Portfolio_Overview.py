@@ -1,7 +1,10 @@
+import copy
+
 import pandas as pd
 import streamlit as st
 
 import nhs_core as core
+import nhs_solver
 import ui_components as ui
 
 core.initialise_state()
@@ -11,11 +14,85 @@ st.caption(
     "A decision-focused portfolio dashboard: what is active, what is ready to schedule, and which trials need attention first."
 )
 
+# Public portfolio visitors can run the existing scheduling engine without
+# navigating through the full NHS staff workflow first.
+def run_quick_demo():
+    # Restore defaults, then load only fictitious demonstration trials.
+    st.session_state.assumptions = {
+        **copy.deepcopy(core.DEFAULT_ASSUMPTIONS),
+        "planning_date": core.current_planning_date(),
+    }
+    core.load_sample_workspace()
+
+    # Same preprocessing performed when staff save Core planning assumptions.
+    st.session_state.trial_table = core.normalise_edited_trials(
+        st.session_state.trial_table,
+        st.session_state.trial_table,
+        st.session_state.assumptions,
+    )
+    operational_demo = core.build_operational_view(
+        st.session_state.trial_table, st.session_state.assumptions
+    )
+    eligible = operational_demo["model_ready"].fillna(False).astype(bool)
+    if not eligible.any():
+        raise ValueError("The synthetic sample has no trials eligible for scheduling.")
+
+    # Invoke the unchanged solver used by the Schedule page.
+    result = nhs_solver.solve_nhs_schedule(
+        st.session_state.trial_table, st.session_state.assumptions
+    )
+    if result.get("schedule") is None or len(result["schedule"]) == 0:
+        raise ValueError("The solver did not return a schedule.")
+    st.session_state.schedule_result = result["schedule"]
+    st.session_state.schedule_info = result.get("technical_info", {})
+    core.mark_schedule_clean(auto_save=True)
+    st.session_state["quick_demo_active"] = True
+
+
 if st.session_state.trial_table is None:
-    st.info("No workspace is loaded. Load the synthetic sample to explore the tool, or go to **Trials** to upload your own workbook.")
-    core.render_sample_data_button(key="overview_sample")
-    core.render_page_navigation(next_page="pages/06_Data_Assumptions.py", next_label="Trials")
+    st.markdown("### Try the interactive scheduling demo")
+    st.write(
+        "See how a clinical trial pharmacy queue can be scheduled, then explore "
+        "what changes when staffing capacity or priorities change."
+    )
+    st.caption(
+        "Synthetic trial data only · Research prototype · Not a live NHS scheduling system"
+    )
+    if st.button(
+        "▶ Run sample scheduling demo",
+        type="primary",
+        use_container_width=True,
+        key="quick_demo_start",
+    ):
+        try:
+            with st.spinner("Loading synthetic trials and generating a schedule…"):
+                run_quick_demo()
+            st.switch_page("pages/03_Recommended_Schedule.py")
+        except Exception as exc:
+            st.error(f"The quick demo could not be completed: {exc}")
+            st.info("You can still use the manual workflow below, or retry the demo.")
+    with st.expander("Prefer to explore the full workflow manually?"):
+        st.write("1. Load synthetic data. 2. Open Capacity and save core assumptions. "
+                 "3. Review Prioritise. 4. Open Schedule and choose Generate / recalculate.")
+        core.render_sample_data_button(key="overview_sample")
+        core.render_page_navigation(next_page="pages/06_Data_Assumptions.py", next_label="Trials")
     st.stop()
+
+# If the visitor loaded sample data manually, offer the same one-click shortcut.
+if (st.session_state.get("uploaded_source_type") == "synthetic sample"
+        and st.session_state.get("schedule_result") is None):
+    st.info("Synthetic data is loaded. You can generate the first schedule instantly.")
+    if st.button("▶ Generate sample schedule", type="primary", key="quick_demo_after_load"):
+        try:
+            with st.spinner("Generating the sample schedule…"):
+                run_quick_demo()
+            st.switch_page("pages/03_Recommended_Schedule.py")
+        except Exception as exc:
+            st.error(f"The quick demo could not be completed: {exc}")
+
+if st.session_state.get("quick_demo_active") and st.session_state.get("schedule_result") is not None:
+    st.success("Demo schedule generated. Try changing CT capacity in Capacity → "
+               "Save core assumptions → Schedule → Generate / recalculate to compare.")
 
 operational = core.build_operational_view(st.session_state.trial_table, st.session_state.assumptions)
 if operational.empty:
