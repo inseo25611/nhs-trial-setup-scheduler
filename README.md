@@ -2,7 +2,7 @@
 
 A Streamlit planning prototype designed to help a hospital pharmacy decide **which clinical trials to set up next, and when**, with the capacity available.
 
-It combines a constraint-programming optimiser (Google OR-Tools CP-SAT) with a simple, step-by-step interface that non-technical pharmacy staff can use without writing code.
+It combines a constraint-programming optimiser (Google OR-Tools CP-SAT) with a simple, step-by-step interface designed for non-technical pharmacy staff, with no coding needed.
 
 **Live demo:** [nhs-trial-setup-scheduler.streamlit.app](https://nhs-trial-setup-scheduler.streamlit.app) — click **Run sample scheduling demo** on the first page to generate a schedule with synthetic trials. Then change **CT capacity** on the Schedule page and select **Recalculate and compare** to view modelled before-and-after outcomes.
 
