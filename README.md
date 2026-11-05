@@ -36,7 +36,8 @@ The question is not just "how long does each trial take?" but **"given limited c
 Each trial is broken into up to three workstreams (clinical trials team, aseptic, ePMA), each with its own capacity limit. The CP-SAT model schedules them on a working-day calendar and solves in two stages:
 
 1. **Maximise the number of trials finishing on time.**
-2. Keeping that number fixed, **minimise priority-weighted lateness**, where a trial's weight rises with its organisational priority and with how much of its target window has already been used.
+2. Keeping that number fixed, **minimise priority-weighted lateness**, where each trial's weight is determined solely by its organisational priority score. Urgency is reflected in the trial's due date, not an additional weight.
+
 
 Rules reflect how the work actually happens: specialist work starts a set number of working days after the clinical trials work begins, completed milestones remove that workload from future demand, and unknown complexity is treated conservatively (upper-bound duration) rather than guessed.
 
